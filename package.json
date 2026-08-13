@@ -1,0 +1,47 @@
+{
+  "name": "everfit-mcp",
+  "version": "0.0.1",
+  "description": "MCP server and API client for Everfit (client-side): read your training sessions, workouts, and profile",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mistersimon/everfit-mcp.git"
+  },
+  "homepage": "https://github.com/mistersimon/everfit-mcp#readme",
+  "bugs": "https://github.com/mistersimon/everfit-mcp/issues",
+  "type": "module",
+  "bin": {
+    "everfit-mcp": "src/server.mjs",
+    "everfit": "src/cli.mjs"
+  },
+  "main": "src/server.mjs",
+  "exports": {
+    ".": "./src/server.mjs",
+    "./client": "./src/client.mjs",
+    "./store": "./src/store.mjs"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/index.mjs",
+    "start": "node src/server.mjs",
+    "prepublishOnly": "node test/index.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "everfit",
+    "fitness",
+    "training"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
+  }
+}

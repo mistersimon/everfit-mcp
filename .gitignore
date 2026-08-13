@@ -1,0 +1,6 @@
+node_modules/
+# Captured traffic contains plaintext credentials and live tokens — never commit.
+*.flows
+*.har
+.env
+.env.*
