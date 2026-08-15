@@ -93,12 +93,65 @@ export function decodeToken(jwt) {
   }
 }
 
+/**
+ * Turn {distance: "7.22km", avg_heart_rate: 126} into the API's (field id, unit id, value) triples.
+ * Both ids come from the activity type's own definition, so an unsupported field or unit fails
+ * here rather than being silently dropped by the API. Values may carry a unit suffix; a bare
+ * number uses the field's default unit.
+ */
+export function trackingFields(library, metrics = {}) {
+  const fields = library.log_activity_fields ?? [];
+  return Object.entries(metrics)
+    .filter(([, v]) => v != null && v !== "")
+    .map(([code, raw]) => {
+      const field = fields.find((f) => f.unique_code === code);
+      if (!field) {
+        const allowed = fields.map((f) => f.unique_code).join(", ") || "no metrics";
+        throw new Error(`${library.name} does not accept "${code}" — it accepts: ${allowed}`);
+      }
+      const units = field.unit_category?.units ?? [];
+      const m = /^\s*(-?[\d.]+)\s*([a-zA-Z]*)\s*$/.exec(String(raw));
+      if (!m) throw new Error(`unparseable value for ${code}: ${raw}`);
+      const wanted = m[2] || field.unit_category?.default_unit?.unique_code;
+      const unit = units.find((u) => u.unique_code.toLowerCase() === String(wanted).toLowerCase());
+      if (!unit) throw new Error(`${code} unit must be one of: ${units.map((u) => u.unique_code).join(", ")}`);
+      return { log_activity_field: field._id, unit: unit._id, value: Number(m[1]) };
+    });
+}
+
+/** Existing tracking_fields come back expanded ({field: {...}, unit: {...}}); flatten to codes. */
+export function metricsFromActivity(activity) {
+  return Object.fromEntries(
+    (activity.tracking_fields ?? []).map((f) => [
+      f.log_activity_field?.unique_code ?? f.log_activity_field,
+      `${f.value}${f.unit?.unique_code ?? ""}`,
+    ]),
+  );
+}
+
 export class EverfitError extends Error {
   constructor(status, path, body) {
-    super(`${path}: ${status} ${body}`);
+    super(`${path}: ${status} ${summarizeErrorBody(status, body)}`);
     this.status = status;
     this.path = path;
-    this.body = body;
+    this.body = body; // full body preserved; only the message is condensed
+  }
+}
+
+/**
+ * API errors are JSON, but gateway errors (502/504) are HTML pages. Keep the message short and
+ * useful in both cases — a full HTML error page is noise in a terminal and in model context.
+ */
+function summarizeErrorBody(status, body = "") {
+  if (/^\s*</.test(body)) {
+    const gateway = status >= 500 ? " (upstream gateway error, usually transient — retry)" : "";
+    return `${(/<title>([^<]+)<\/title>/i.exec(body)?.[1] ?? "HTML error page").trim()}${gateway}`;
+  }
+  try {
+    const d = JSON.parse(body);
+    return d.message ?? d.error ?? body.slice(0, 300);
+  } catch {
+    return body.slice(0, 300);
   }
 }
 
@@ -186,8 +239,26 @@ export function createClient({ email, password, timezone, token, clientId, baseU
     return r.json();
   }
 
+  /** JSON-body request (POST/PATCH/PUT/DELETE). Same 401-renew behaviour as get(). */
+  async function send(method, path, body, retry = true) {
+    const { token } = await login();
+    const r = await fetch(`${BASE}/${path.replace(/^\//, "")}`, {
+      method,
+      headers: headers({ "x-access-token": token, "content-type": "application/json" }),
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (r.status === 401 && retry && canLogin) {
+      session = null;
+      await login({ force: true });
+      return send(method, path, body, false);
+    }
+    if (!r.ok) throw new EverfitError(r.status, path, await r.text());
+    return r.json();
+  }
+
   return {
     get,
+    send,
     login,
     get session() {
       return session;
@@ -234,6 +305,119 @@ export function createClient({ email, password, timezone, token, clientId, baseU
         prescribed: sections(d.sections_target),
         logged: sections(d.sections_complete),
       };
+    },
+
+    /** Activity types you can log, e.g. Run, Walk, Cycling. Omit text for the popular list. */
+    async searchActivityLibraries(text) {
+      if (!text) return (await get("log-activity-libraries/popular")).data ?? [];
+      const res = await get("log-activity-categories/v2/section", { page: 1, perPage: 20, textSearch: text });
+      return (res.data ?? []).flatMap((c) => (c.libraries ?? []).map((l) => ({ ...l, category: c.unique_code })));
+    },
+
+    /** One activity type with the metric fields it accepts and each field's valid units. */
+    async getActivityLibrary(libraryId) {
+      return (await get(`log-activity-libraries/${libraryId}`)).data;
+    },
+
+    /**
+     * Log a cardio/activity session — the "+ Activity" flow in the app, not a workout assignment.
+     *
+     * @param {object} a
+     * @param {string} [a.activity]   activity name to look up, e.g. "Run" (or pass libraryId)
+     * @param {string} [a.libraryId]  skip the lookup with a known log_activity_library id
+     * @param {Date|string} a.start   start time
+     * @param {Date|string} [a.end]   end time; or give durationMinutes
+     * @param {number} [a.durationMinutes]
+     * @param {object} [a.metrics]    by field code: {distance: "7.22km", avg_heart_rate: 126, calories: 500}
+     *                                bare numbers use the field's default unit
+     * @param {string} [a.note]
+     */
+    async logActivity({ activity, libraryId, start, end, durationMinutes, metrics = {}, note = "" }) {
+      if (!libraryId) {
+        if (!activity) throw new Error("logActivity needs activity or libraryId");
+        const matches = await this.searchActivityLibraries(activity);
+        const exact = matches.find((m) => m.name.toLowerCase() === activity.toLowerCase());
+        const hit = exact ?? matches[0];
+        if (!hit) throw new Error(`no activity type matches "${activity}"`);
+        libraryId = hit._id;
+      }
+      const library = await this.getActivityLibrary(libraryId);
+
+      const startAt = new Date(start);
+      if (Number.isNaN(startAt.getTime())) throw new Error(`unparseable start time: ${start}`);
+      const endAt = end
+        ? new Date(end)
+        : durationMinutes != null
+          ? new Date(startAt.getTime() + durationMinutes * 60_000)
+          : null;
+      if (!endAt || Number.isNaN(endAt.getTime())) throw new Error("logActivity needs end or durationMinutes");
+      if (endAt <= startAt) throw new Error("end time must be after start time");
+
+      const tracking_fields = trackingFields(library, metrics);
+
+      const res = await send("POST", "log-activities", {
+        log_activity_library: libraryId,
+        tracking_fields,
+        note,
+        icon: library.icon,
+        background_icon_color: library.background_icon_color,
+        start_time: startAt.toISOString(),
+        end_time: endAt.toISOString(),
+      });
+      return res.data ?? res;
+    },
+
+    /**
+     * Edit a logged activity. The API replaces the whole record, so this reads the current one,
+     * applies your changes on top, and sends the merged result — fields you omit are preserved.
+     * Set a metric to null to remove it.
+     *
+     * Note: `rating` cannot be changed here — the API accepts the field and ignores it (verified
+     * against the captured payload shape), so the current value is passed through unchanged.
+     *
+     * @param {string} activityId
+     * @param {object} changes {start, end, durationMinutes, metrics, note}
+     */
+    async updateActivity(activityId, { start, end, durationMinutes, metrics, note } = {}) {
+      const current = await this.getActivity(activityId);
+      const libraryId = current.log_activity_library?._id ?? current.log_activity_library;
+      const library = await this.getActivityLibrary(libraryId);
+
+      const startAt = start != null ? new Date(start) : new Date(current.start_time);
+      if (Number.isNaN(startAt.getTime())) throw new Error(`unparseable start time: ${start}`);
+      let endAt;
+      if (end != null) endAt = new Date(end);
+      else if (durationMinutes != null) endAt = new Date(startAt.getTime() + durationMinutes * 60_000);
+      else endAt = new Date(current.end_time);
+      if (Number.isNaN(endAt.getTime())) throw new Error(`unparseable end time: ${end}`);
+      if (endAt <= startAt) throw new Error("end time must be after start time");
+
+      // null removes a metric; omitted metrics keep their current value.
+      const merged = { ...metricsFromActivity(current), ...(metrics ?? {}) };
+      for (const [k, v] of Object.entries(merged)) if (v == null || v === "") delete merged[k];
+
+      const res = await send("PATCH", `log-activities/${activityId}`, {
+        icon: current.icon ?? library.icon,
+        background_icon_color: current.background_icon_color ?? library.background_icon_color,
+        rating: current.rating ?? -1, // preserved, not settable
+
+        tracking_fields: trackingFields(library, merged),
+        log_type: current.log_type ?? "normal",
+        note: note ?? current.note ?? "",
+        start_time: startAt.toISOString(),
+        end_time: endAt.toISOString(),
+      });
+      return res.data ?? res;
+    },
+
+    /** Delete a logged activity. Takes the id logActivity returned. */
+    async deleteActivity(activityId) {
+      return send("DELETE", `log-activities/${activityId}`);
+    },
+
+    /** One logged activity by id. */
+    async getActivity(activityId) {
+      return (await get(`log-activities/${activityId}`)).data;
     },
 
     /** Profile with credential fields stripped — this payload embeds a fresh firebase_token. */

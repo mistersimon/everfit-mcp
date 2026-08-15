@@ -129,6 +129,225 @@ await assert.rejects(
   }
 }
 
+// --- logActivity: resolves field and unit ids from the library, or refuses ---
+{
+  const RUN_LIBRARY = {
+    _id: "lib-run",
+    name: "Run",
+    icon: "🏃",
+    background_icon_color: "#FCF5DE",
+    log_activity_fields: [
+      {
+        _id: "f-cal",
+        unique_code: "calories",
+        unit_category: { default_unit: { unique_code: "kcal" }, units: [{ _id: "u-kcal", unique_code: "kcal" }] },
+      },
+      {
+        _id: "f-dist",
+        unique_code: "distance",
+        unit_category: {
+          default_unit: { unique_code: "mi" },
+          units: [
+            { _id: "u-mi", unique_code: "mi" },
+            { _id: "u-km", unique_code: "km" },
+          ],
+        },
+      },
+      {
+        _id: "f-hr",
+        unique_code: "avg_heart_rate",
+        unit_category: { default_unit: { unique_code: "bpm" }, units: [{ _id: "u-bpm", unique_code: "bpm" }] },
+      },
+    ],
+  };
+  const realFetch = globalThis.fetch;
+  let posted = null;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (u.endsWith("/auth/login/"))
+      return new Response(JSON.stringify({ token: jwt({ profileId: "abc", exp: inDays(10) }), user: { _id: "abc" } }));
+    if (u.includes("/log-activity-libraries/lib-run")) return new Response(JSON.stringify({ data: RUN_LIBRARY }));
+    if (u.includes("/log-activity-categories/v2/section"))
+      return new Response(JSON.stringify({ data: [{ unique_code: "cardio", libraries: [{ _id: "lib-run", name: "Run" }] }] }));
+    if (u.endsWith("/log-activities")) {
+      posted = JSON.parse(opts.body);
+      return new Response(JSON.stringify({ data: { _id: "act-1", ...posted } }));
+    }
+    throw new Error(`unexpected request: ${u}`);
+  };
+  try {
+    const c = createClient({ email: "e", password: "p" });
+
+    await c.logActivity({
+      activity: "Run",
+      start: "2026-08-12T00:55:00.000Z",
+      durationMinutes: 46,
+      metrics: { distance: "7.22km", avg_heart_rate: 126, calories: null }, // null is dropped, not sent as 0
+      note: "easy",
+    });
+    assert.equal(posted.log_activity_library, "lib-run");
+    assert.equal(posted.icon, "🏃"); // icon/colour copied from the library, as the app does
+    assert.equal(posted.start_time, "2026-08-12T00:55:00.000Z");
+    assert.equal(posted.end_time, "2026-08-12T01:41:00.000Z"); // duration applied
+    assert.deepEqual(posted.tracking_fields, [
+      { log_activity_field: "f-dist", unit: "u-km", value: 7.22 }, // explicit unit honoured
+      { log_activity_field: "f-hr", unit: "u-bpm", value: 126 }, // bare number takes default unit
+    ]);
+
+    // A bare distance must use the library's default unit (mi), not guess km.
+    await c.logActivity({ libraryId: "lib-run", start: "2026-08-12T00:00:00Z", durationMinutes: 30, metrics: { distance: 5 } });
+    assert.deepEqual(posted.tracking_fields, [{ log_activity_field: "f-dist", unit: "u-mi", value: 5 }]);
+
+    // Refuse rather than silently drop what the API would ignore.
+    await assert.rejects(
+      c.logActivity({ libraryId: "lib-run", start: "2026-08-12T00:00:00Z", durationMinutes: 5, metrics: { power: 200 } }),
+      /does not accept "power"/,
+    );
+    await assert.rejects(
+      c.logActivity({ libraryId: "lib-run", start: "2026-08-12T00:00:00Z", durationMinutes: 5, metrics: { distance: "5furlongs" } }),
+      /unit must be one of: mi, km/,
+    );
+    await assert.rejects(
+      c.logActivity({ libraryId: "lib-run", start: "2026-08-12T00:00:00Z", end: "2026-08-11T00:00:00Z" }),
+      /end time must be after start/,
+    );
+    await assert.rejects(c.logActivity({ libraryId: "lib-run", start: "not a date", durationMinutes: 5 }), /unparseable start/);
+    await assert.rejects(c.logActivity({ libraryId: "lib-run", start: "2026-08-12T00:00:00Z" }), /needs end or durationMinutes/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// --- updateActivity: the API replaces the whole record, so omitted fields must be carried over ---
+{
+  const LIBRARY = {
+    _id: "lib-run",
+    name: "Run",
+    icon: "🏃",
+    background_icon_color: "#FCF5DE",
+    log_activity_fields: [
+      {
+        _id: "f-cal",
+        unique_code: "calories",
+        unit_category: { default_unit: { unique_code: "kcal" }, units: [{ _id: "u-kcal", unique_code: "kcal" }] },
+      },
+      {
+        _id: "f-dist",
+        unique_code: "distance",
+        unit_category: {
+          default_unit: { unique_code: "mi" },
+          units: [
+            { _id: "u-mi", unique_code: "mi" },
+            { _id: "u-km", unique_code: "km" },
+          ],
+        },
+      },
+      {
+        _id: "f-hr",
+        unique_code: "avg_heart_rate",
+        unit_category: { default_unit: { unique_code: "bpm" }, units: [{ _id: "u-bpm", unique_code: "bpm" }] },
+      },
+    ],
+  };
+  const EXISTING = {
+    _id: "act-1",
+    name: "Run",
+    log_activity_library: { _id: "lib-run" },
+    icon: "🏃",
+    background_icon_color: "#FCF5DE",
+    rating: 4,
+    log_type: "normal",
+    note: "original",
+    start_time: "2026-08-12T00:55:00.000Z",
+    end_time: "2026-08-12T01:41:00.000Z",
+    tracking_fields: [
+      { log_activity_field: { unique_code: "distance" }, value: 10, unit: { unique_code: "km" } },
+      { log_activity_field: { unique_code: "avg_heart_rate" }, value: 140, unit: { unique_code: "bpm" } },
+    ],
+  };
+  const realFetch = globalThis.fetch;
+  let patched = null;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (u.endsWith("/auth/login/"))
+      return new Response(JSON.stringify({ token: jwt({ profileId: "abc", exp: inDays(10) }), user: { _id: "abc" } }));
+    if (u.includes("/log-activity-libraries/lib-run")) return new Response(JSON.stringify({ data: LIBRARY }));
+    if (u.includes("/log-activities/act-1")) {
+      if (opts.method === "PATCH") {
+        patched = JSON.parse(opts.body);
+        return new Response(JSON.stringify({ data: { ...EXISTING, ...patched } }));
+      }
+      return new Response(JSON.stringify({ data: EXISTING }));
+    }
+    throw new Error(`unexpected request: ${u}`);
+  };
+  try {
+    const c = createClient({ email: "e", password: "p" });
+
+    // Changing only the duration must not drop the metrics or the note.
+    await c.updateActivity("act-1", { durationMinutes: 46 });
+    assert.equal(patched.note, "original");
+    assert.equal(patched.end_time, "2026-08-12T01:41:00.000Z"); // 55 + 46 min
+    assert.deepEqual(patched.tracking_fields, [
+      { log_activity_field: "f-dist", unit: "u-km", value: 10 },
+      { log_activity_field: "f-hr", unit: "u-bpm", value: 140 },
+    ]);
+
+    // Changing one metric leaves the others intact, units included.
+    await c.updateActivity("act-1", { metrics: { distance: "7.22km" } });
+    assert.deepEqual(patched.tracking_fields, [
+      { log_activity_field: "f-dist", unit: "u-km", value: 7.22 },
+      { log_activity_field: "f-hr", unit: "u-bpm", value: 140 },
+    ]);
+
+    // null removes just that metric.
+    await c.updateActivity("act-1", { metrics: { avg_heart_rate: null } });
+    assert.deepEqual(patched.tracking_fields, [{ log_activity_field: "f-dist", unit: "u-km", value: 10 }]);
+
+    // Adding a metric that was not there before.
+    await c.updateActivity("act-1", { metrics: { calories: 600 } });
+    assert.ok(patched.tracking_fields.some((f) => f.log_activity_field === "f-cal" && f.value === 600));
+
+    // rating is passed through untouched — the API ignores changes to it.
+    assert.equal(patched.rating, 4);
+
+    await assert.rejects(c.updateActivity("act-1", { end: "2026-08-11T00:00:00Z" }), /end time must be after start/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// --- error bodies: condensed for humans and model context, full body kept on the error ---
+{
+  const realFetch = globalThis.fetch;
+  const html = "<html>\n<head><title>502 Bad Gateway</title></head>\n<body>...</body>\n</html>";
+  globalThis.fetch = async (url) =>
+    String(url).endsWith("/auth/login/")
+      ? new Response(JSON.stringify({ token: jwt({ profileId: "abc", exp: inDays(10) }), user: { _id: "abc" } }))
+      : new Response(html, { status: 502 });
+  try {
+    const e = await createClient({ email: "e", password: "p" }).getProfile().catch((err) => err);
+    assert.match(e.message, /502 Bad Gateway \(upstream gateway error, usually transient/);
+    assert.doesNotMatch(e.message, /<html>/); // the page itself must not reach the message
+    assert.equal(e.body, html); // still available for debugging
+    assert.equal(e.status, 502);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // A JSON API error surfaces just its message.
+  globalThis.fetch = async (url) =>
+    String(url).endsWith("/auth/login/")
+      ? new Response(JSON.stringify({ token: jwt({ profileId: "abc", exp: inDays(10) }), user: { _id: "abc" } }))
+      : new Response(JSON.stringify({ error: "E_NOT_FOUND", message: "Log activity not found" }), { status: 404 });
+  try {
+    const e = await createClient({ email: "e", password: "p" }).getActivity("nope").catch((err) => err);
+    assert.match(e.message, /404 Log activity not found/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 // --- session store: state lives in a file the user owns, not in the MCP config or model context ---
 {
   const dir = mkdtempSync(join(tmpdir(), "everfit-store-"));

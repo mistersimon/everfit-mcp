@@ -7,6 +7,10 @@
 //   node cli.mjs days [start] [end]          raw day-by-day payload, includes rest days
 //   node cli.mjs workout <id> [--raw]        one workout
 //   node cli.mjs profile
+//   node cli.mjs activities [search]         activity types available to log
+//   node cli.mjs log Run --duration 46 --distance 7.22km --hr 126   log a cardio session
+//   node cli.mjs edit <id> --duration 46 --distance 7.5km   change a logged activity
+//   node cli.mjs activity <id> | delete-activity <id>
 //   node cli.mjs get <path> [k=v ...]        any endpoint, e.g. get habits/client-today
 // Env (EVERFIT_EMAIL/PASSWORD, EVERFIT_TOKEN) overrides the stored session.
 import { createInterface } from "node:readline";
@@ -15,8 +19,34 @@ import { createClient, decodeToken } from "./client.mjs";
 import { clearSession, permissionWarning, readSession, sessionPath, storedClientOptions, writeSession } from "./store.mjs";
 
 const [cmd, ...rest] = process.argv.slice(2);
-const flags = new Set(rest.filter((a) => a.startsWith("--")));
-const args = rest.filter((a) => !a.startsWith("--"));
+
+// Flags that take a value; everything else starting with -- is a boolean. Listing them explicitly
+// keeps `workout <id> --raw` from swallowing a following positional argument.
+// Short CLI flag -> the API's field code.
+const METRIC_FLAGS = {
+  distance: "distance",
+  hr: "avg_heart_rate",
+  calories: "calories",
+  elevation: "elevation_gain",
+  cadence: "avg_cadence",
+  power: "power",
+  reps: "reps",
+};
+const VALUE_FLAGS = new Set(["start", "end", "duration", "note", "library", ...Object.keys(METRIC_FLAGS)]);
+const opts = {};
+const args = [];
+for (let i = 0; i < rest.length; i++) {
+  const a = rest[i];
+  if (!a.startsWith("--")) {
+    args.push(a);
+    continue;
+  }
+  const [key, inline] = a.slice(2).split(/=(.*)/s);
+  if (inline !== undefined) opts[key] = inline;
+  else if (VALUE_FLAGS.has(key) && rest[i + 1] !== undefined) opts[key] = rest[++i];
+  else opts[key] = true;
+}
+const flags = new Set(Object.keys(opts).map((k) => `--${k}`)); // back-compat for boolean checks
 const out = (v) => console.log(JSON.stringify(v, null, 2));
 const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
 
@@ -122,6 +152,66 @@ try {
     case "profile":
       out(await everfit.getProfile());
       break;
+    case "activities":
+      out((await everfit.searchActivityLibraries(args[0])).map((l) => ({ id: l._id, name: l.name, icon: l.icon })));
+      break;
+    case "log": {
+      if (!args[0] && !opts.library) throw new Error('usage: log <activity> --duration <min> [--distance 7.22km] [--hr 126]');
+      const metrics = Object.fromEntries(Object.entries(METRIC_FLAGS).map(([flag, code]) => [code, opts[flag]]));
+      const durationMinutes = opts.duration != null ? Number(opts.duration) : undefined;
+      if (opts.duration != null && !Number.isFinite(durationMinutes)) throw new Error("--duration must be minutes");
+      // Default to a session that just ended, which is the common case for logging after the fact.
+      const start =
+        opts.start ?? (durationMinutes != null ? new Date(Date.now() - durationMinutes * 60_000) : new Date());
+      const activity = { activity: args[0], libraryId: opts.library, start, end: opts.end, durationMinutes, metrics, note: opts.note ?? "" };
+      if (opts["dry-run"]) {
+        out({ dryRun: true, ...activity, start: new Date(start).toISOString() });
+        break;
+      }
+      const logged = await everfit.logActivity(activity);
+      out({
+        activity_id: logged._id,
+        name: logged.name,
+        start_time: logged.start_time,
+        end_time: logged.end_time,
+        tracking_fields: logged.tracking_fields,
+        note: logged.note,
+      });
+      break;
+    }
+    case "edit": {
+      if (!args[0]) throw new Error("usage: edit <activity_id> [--duration 46] [--distance 7.5km] [--note ...]");
+      // Only send what was actually passed: omitted metrics keep their value, --no-<metric> clears.
+      const metrics = {};
+      for (const [flag, code] of Object.entries(METRIC_FLAGS)) {
+        if (opts[flag] != null) metrics[code] = opts[flag];
+        if (opts[`no-${flag}`]) metrics[code] = null;
+      }
+      const updated = await everfit.updateActivity(args[0], {
+        start: opts.start,
+        end: opts.end,
+        durationMinutes: opts.duration != null ? Number(opts.duration) : undefined,
+        metrics: Object.keys(metrics).length ? metrics : undefined,
+        note: opts.note,
+      });
+      out({
+        activity_id: updated._id,
+        name: updated.name,
+        start_time: updated.start_time,
+        end_time: updated.end_time,
+        tracking_fields: updated.tracking_fields,
+        note: updated.note,
+      });
+      break;
+    }
+    case "delete-activity":
+      if (!args[0]) throw new Error("usage: delete-activity <activity_id>");
+      out(await everfit.deleteActivity(args[0]));
+      break;
+    case "activity":
+      if (!args[0]) throw new Error("usage: activity <activity_id>");
+      out(await everfit.getActivity(args[0]));
+      break;
     case "get": {
       if (!args[0]) throw new Error("usage: get <path> [k=v ...]");
       const params = Object.fromEntries(args.slice(1).map((p) => p.split(/=(.*)/s).slice(0, 2)));
@@ -130,8 +220,16 @@ try {
     }
     default:
       console.error(
-        "commands: login [--save-password] | whoami | logout | sessions [start] [end] | " +
-          "days [start] [end] | workout <id> [--raw] | profile | get <path> [k=v ...]",
+        "commands:\n" +
+          "  login [--save-password] | whoami | logout\n" +
+          "  sessions [start] [end] | days [start] [end] | workout <id> [--raw] | profile\n" +
+          "  activities [search]                       list activity types you can log\n" +
+          "  log <activity> --duration <min> [--start <time>] [--end <time>]\n" +
+          "      [--distance 7.22km] [--hr 126] [--calories 500] [--elevation 40m]\n" +
+          "      [--cadence 170] [--power 200] [--reps 50] [--note ...] [--dry-run]\n" +
+          "  edit <activity_id> [--duration 46] [same metric flags] [--no-hr] [--note ...]\n" +
+          "  activity <id> | delete-activity <id>\n" +
+          "  get <path> [k=v ...]                      any endpoint",
       );
       process.exit(1);
   }

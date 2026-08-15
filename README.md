@@ -19,7 +19,7 @@ Not published yet? Three ways to install it elsewhere without a registry:
 
 ```bash
 npm pack                                  # produces everfit-mcp-<version>.tgz
-npm i -g ./everfit-mcp-0.0.1.tgz          # copy the tarball to any machine
+npm i -g ./everfit-mcp-0.0.2.tgz          # copy the tarball to any machine
 npx github:mistersimon/everfit-mcp        # or install straight from the git repo
 git clone https://github.com/mistersimon/everfit-mcp.git && npm install   # for development
 ```
@@ -140,8 +140,15 @@ long-lived unattended install needs the password to keep working.
 | `list_training_sessions(start_date?, end_date?)` | Workouts in a date range (`YYYY-MM-DD`). Defaults to 7 days back through 14 days ahead, so past *and* upcoming sessions appear. Returns an `assignment_id` per workout. |
 | `get_training_session(assignment_id)` | One workout: prescribed sections/exercises/sets plus what you logged. |
 | `get_profile()` | Your client profile (name, units, timezone, trainer). |
+| `list_activity_types(query?)` | Activity types available to `log_activity` (Run, Walk, Cycling, ...). |
+| `log_activity({activity, duration_minutes \| end, start?, distance?, avg_heart_rate?, ...})` | **Writes.** Logs a cardio session your coach can see. Returns the new `activity_id` and an `undo` command. |
 
-All read-only. Nothing here writes to your account.
+`log_activity` is the only tool that writes. Its description tells the model to confirm details
+first and not to invent metrics, but that is a prompt, not a guarantee — an agent can create real
+entries in your training log. There is deliberately **no delete tool**, so nothing an agent does is
+destructive; remove a mistaken entry yourself with `everfit delete-activity <id>` (the tool returns
+the exact command). Drop the `log_activity` registration from `src/server.mjs` if you want a
+strictly read-only server.
 
 ## CLI
 
@@ -149,7 +156,7 @@ All read-only. Nothing here writes to your account.
 everfit login [--save-password]        # store a session the MCP server reads
 everfit whoami                         # who is logged in, when the token expires
 everfit logout                         # delete the stored session
-everfit sessions [start] [end]         # workouts, YYYY-MM-DD, default last 7 days
+everfit sessions [start] [end]         # workouts, YYYY-MM-DD, default -7d..+14d
 everfit days [start] [end]             # raw day-by-day payload, includes rest days
 everfit workout <assignment_id>        # one workout, flattened
 everfit workout <assignment_id> --raw  # untouched API payload
@@ -158,6 +165,33 @@ everfit get <path> [k=v ...]           # any endpoint, e.g. get habits/client-to
 ```
 
 `get` is the escape hatch for exploring endpoints this package does not wrap yet.
+
+### Logging a cardio session
+
+Cardio and other non-assigned activity is a **log activity**, a different object from a coach's
+workout assignment. `everfit log` creates one, the same as "+ Activity" in the app:
+
+```bash
+everfit activities                     # popular activity types
+everfit activities run                 # search: Run, Trail Run, ...
+everfit log Run --duration 46 --distance 7.22km --hr 126
+everfit log Run --start "2026-08-12T08:55" --end "2026-08-12T09:41" --distance 4.5mi --dry-run
+everfit activity <activity_id>         # read one back
+everfit edit <activity_id> --duration 46 --distance 7.22km
+everfit edit <activity_id> --no-hr --note "felt easy"   # --no-<metric> clears one
+everfit delete-activity <activity_id>  # remove it
+```
+
+- `--duration` is minutes. With no `--start`, the session is assumed to have just ended.
+- Metric flags: `--distance --hr --calories --elevation --cadence --power --reps`. A bare number
+  uses the field's default unit (**miles** for distance), so pass `7.22km` if you mean km.
+- Each activity type accepts only some metrics — Run takes distance, avg_heart_rate and calories,
+  and anything else is rejected with the list it does accept rather than being silently dropped.
+- `--dry-run` prints the payload without sending it.
+- `edit` merges: the API replaces the whole record, so the client reads the current activity first
+  and carries over anything you did not pass. Clear a single metric with `--no-hr`, `--no-distance`
+  and so on. `rating` cannot be changed — the API accepts the field and ignores it (verified), so
+  the existing value is preserved.
 
 ## Library
 
@@ -197,6 +231,11 @@ test/index.mjs   npm test
   `160kg x5 @RPE7 rest120`.
 - Assignment `status`: 0 and 2 confirmed (`not_started`, `completed`); 1 (`in_progress`) is
   inferred. Unknown codes pass through as numbers.
+- Logged activities (cardio) are a separate object from workout assignments:
+  `POST /api/log-activities` with `{log_activity_library, tracking_fields, start_time, end_time,
+  icon, background_icon_color}`. Duration is implied by the timestamps — there is no duration field.
+  `tracking_fields` entries are `{log_activity_field, unit, value}` id triples, and the valid field
+  and unit ids for an activity come from `GET /api/log-activity-libraries/:id`.
 - Future workouts are ordinary assignments: same endpoint, `status: not_started`, full prescribed
   sets, empty `logged`. There is no separate "upcoming" endpoint and no server-side cap on how far
   ahead you can query — you only get days your coach has actually scheduled, so a range past the
