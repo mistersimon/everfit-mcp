@@ -1,0 +1,54 @@
+name: publish
+
+# The version in package.json is the trigger: push a commit to main that changes it and this
+# publishes, tags and releases. Anything else on main is a no-op.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag and the GitHub Release
+      id-token: write # npm trusted publishing (OIDC) — no NPM_TOKEN secret needed
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # release notes need history
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1; the npm bundled with Node 22 is older.
+      - run: npm install -g npm@latest
+
+      # Compare against what is actually on the registry, not against the previous commit —
+      # a re-run, a revert or a squashed history can all make a git diff lie.
+      - name: Is this version already published?
+        id: check
+        run: |
+          local=$(node -p "require('./package.json').version")
+          name=$(node -p "require('./package.json').name")
+          published=$(npm view "$name@$local" version 2>/dev/null || true)
+          echo "version=$local" >> "$GITHUB_OUTPUT"
+          if [ -n "$published" ]; then
+            echo "v$local already on npm — nothing to do"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check.outputs.publish == 'true'
+        run: npm ci
+      - if: steps.check.outputs.publish == 'true'
+        run: npm test
+      - if: steps.check.outputs.publish == 'true'
+        run: npm publish --provenance
+
+      # Tag only after npm accepted it, so a failed publish leaves no tag to clean up.
+      - if: steps.check.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ steps.check.outputs.version }}" --generate-notes

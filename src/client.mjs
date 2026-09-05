@@ -1,10 +1,10 @@
-// Pure Everfit API client — no MCP. Reverse-engineered from iOS app traffic (v3.84.2).
+// Pure Everfit API client — no MCP. Reverse-engineered from iOS app traffic (v3.88.1).
 // Usable standalone: import { createClient } from "./client.mjs"
 // No `process` on Hermes/browsers/Workers — read env defensively so this file loads anywhere.
 const env = typeof process === "undefined" ? {} : (process.env ?? {});
 // Overridable: accounts on another backend shard set EVERFIT_API_BASE.
 const DEFAULT_BASE = env.EVERFIT_API_BASE ?? "https://api-prod4.everfit.io/api";
-const UA = "everfit/3.84.2 (io.everfit.appv2; build:1; iOS 26.5.0) Alamofire/5.4.3";
+const UA = "everfit/3.88.1 (io.everfit.appv2; build:1; iOS 26.5.0) Alamofire/5.4.3";
 const systemTz = () => Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
 
 const pad = (n) => String(n).padStart(2, "0");
@@ -127,6 +127,47 @@ export function metricsFromActivity(activity) {
       `${f.value}${f.unit?.unique_code ?? ""}`,
     ]),
   );
+}
+
+/**
+ * Resolve a body-metric entry's (unique_code, unit id, value) from the client's metric catalog.
+ * Units are per-metric ObjectIds, never a global table, so an unknown metric or unit fails here
+ * rather than being silently accepted. Value may carry a unit suffix ("82.8kg"); a bare number
+ * uses the metric's own unit, or the only unit it has.
+ */
+export function bodyMetricEntry(metrics, name, rawValue, wantedUnit) {
+  const want = String(name).toLowerCase().trim();
+  const metric =
+    metrics.find((m) => m.unique_code?.toLowerCase() === want) ??
+    metrics.find((m) => m.name?.toLowerCase() === want) ??
+    metrics.find((m) => m.unique_code?.toLowerCase().startsWith(`${want}_`)) ?? // team-scoped: neck_<teamId>
+    metrics.find((m) => m.name?.toLowerCase().includes(want));
+  if (!metric) {
+    const codes = metrics.map((m) => m.unique_code).join(", ");
+    throw new Error(`no body metric matches "${name}" — available: ${codes}`);
+  }
+
+  const m = /^\s*(-?[\d.]+)\s*([^\s\d]*)\s*$/.exec(String(rawValue));
+  if (!m) throw new Error(`unparseable value for ${metric.unique_code}: ${rawValue}`);
+  const value = Number(m[1]);
+  if (!Number.isFinite(value)) throw new Error(`unparseable value for ${metric.unique_code}: ${rawValue}`);
+
+  const units = metric.category?.units ?? [];
+  // The metric carries the unit the client already logs it in; fall back to the only one it has.
+  const current = metric.unit?._id ?? metric.unit;
+  const wanted = wantedUnit ?? m[2] ?? "";
+  let unit;
+  if (wanted) unit = units.find((u) => u.unique_code?.toLowerCase() === String(wanted).toLowerCase());
+  else unit = units.find((u) => u._id === current) ?? (units.length === 1 ? units[0] : null);
+  if (!unit) {
+    const allowed = units.map((u) => u.unique_code).join(", ") || "none";
+    throw new Error(
+      wanted
+        ? `${metric.unique_code} unit must be one of: ${allowed}`
+        : `${metric.unique_code} needs an explicit unit — one of: ${allowed}`,
+    );
+  }
+  return { unique_code: metric.unique_code, value, unit: unit._id };
 }
 
 export class EverfitError extends Error {
@@ -418,6 +459,45 @@ export function createClient({ email, password, timezone, token, clientId, baseU
     /** One logged activity by id. */
     async getActivity(activityId) {
       return (await get(`log-activities/${activityId}`)).data;
+    },
+
+    /**
+     * Body metrics this account can log (weight, steps, body_fat, plus any the coach added),
+     * each with the units it accepts. Same role list_activity_types plays for cardio.
+     */
+    async listBodyMetrics() {
+      const { clientId: id } = await login();
+      if (!id) throw new Error("could not determine clientId — pass clientId or use email/password");
+      const res = await get("body-metric/get-full-list-client-body-metric", { clientId: id });
+      return res.data ?? [];
+    },
+
+    /**
+     * Log a body-metric entry — the app's metric-tracking flow (weight, steps, ...), separate from
+     * both workout assignments and logged activities.
+     *
+     * @param {object} e
+     * @param {string} e.metric        unique_code or display name, e.g. "weight"
+     * @param {number|string} e.value  82.8, or "82.8kg" to name the unit inline
+     * @param {string} [e.unit]        unit code, e.g. "kg" — defaults to the metric's current unit
+     * @param {Date|string} [e.date]   defaults to now; a bare YYYY-MM-DD lands at local noon so the
+     *                                 server's day bucket cannot shift across a timezone boundary
+     */
+    async logBodyMetric({ metric, value, unit, date }) {
+      if (!metric) throw new Error("logBodyMetric needs a metric");
+      if (value == null || value === "") throw new Error("logBodyMetric needs a value");
+      const entry = bodyMetricEntry(await this.listBodyMetrics(), metric, value, unit);
+
+      const at = date == null ? new Date() : new Date(/^\d{4}-\d{2}-\d{2}$/.test(date) ? `${date}T12:00:00` : date);
+      if (Number.isNaN(at.getTime())) throw new Error(`unparseable date: ${date}`);
+
+      const { clientId: id } = await login();
+      const res = await send("POST", "body-metric-entry/add-entry", {
+        client: id,
+        date: at.toISOString(),
+        ...entry,
+      });
+      return res.data ?? res;
     },
 
     /** Profile with credential fields stripped — this payload embeds a fresh firebase_token. */

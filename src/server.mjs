@@ -135,6 +135,58 @@ server.registerTool(
   }),
 );
 
+server.registerTool(
+  "list_body_metrics",
+  {
+    description:
+      "Body metrics I can log with log_body_metric (weight, steps, body_fat, ...), each with the " +
+      "units it accepts. My coach controls which exist, so this list is account-specific — check " +
+      "it rather than assuming a metric is available.",
+    inputSchema: {},
+  },
+  json(() =>
+    everfit
+      .listBodyMetrics()
+      .then((ms) =>
+        ms.map((m) => ({
+          metric: m.unique_code,
+          name: m.name,
+          units: (m.category?.units ?? []).map((u) => u.unique_code),
+        })),
+      ),
+  ),
+);
+
+server.registerTool(
+  "log_body_metric",
+  {
+    description:
+      "Record a body-metric measurement (weight, steps, body fat, ...) in my Everfit account. " +
+      "THIS WRITES REAL DATA my coach can see, so confirm the value with me first and never guess " +
+      "a measurement I did not state. Pass the unit when I gave one; otherwise the metric's " +
+      "existing unit is used. There is no delete tool — a mistaken entry has to be removed in the " +
+      "Everfit app.",
+    inputSchema: {
+      metric: z.string().describe("metric code or name, e.g. 'weight' — see list_body_metrics"),
+      value: z.number().describe("the measurement, e.g. 82.8"),
+      unit: z.string().optional().describe("unit code, e.g. 'kg' or 'lb'; defaults to the metric's unit"),
+      date: z.string().optional().describe("YYYY-MM-DD or ISO time; defaults to now"),
+    },
+  },
+  json(async (a) => {
+    const e = await everfit.logBodyMetric(a);
+    return {
+      entry_id: e._id,
+      metric: e.metric_code,
+      value: e.value,
+      day: e.day,
+      date: e.date,
+      // No delete endpoint has been captured, so the app is the only way back.
+      undo: "remove this entry in the Everfit app — no API delete is implemented",
+    };
+  }),
+);
+
 // Run directly (including via the npm bin symlink, hence realpath) => serve. Imported => don't.
 const entry = process.argv[1];
 if (entry && import.meta.url === pathToFileURL(realpathSync(entry)).href) {

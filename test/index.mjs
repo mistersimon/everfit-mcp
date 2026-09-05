@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, symlinkSync, unli
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { mdy, setStr, sections, statusName, createClient, decodeToken } from "../src/client.mjs";
+import { mdy, setStr, sections, statusName, createClient, decodeToken, bodyMetricEntry } from "../src/client.mjs";
 import { clearSession, permissionWarning, readSession, sessionPath, storedClientOptions, writeSession } from "../src/store.mjs";
 
 assert.equal(mdy("2026-08-13"), "08-13-2026");
@@ -459,6 +459,63 @@ try {
   assert.match(stdout, /"serverInfo"/, "server did not respond to initialize when run as a script");
 } finally {
   unlinkSync(link);
+}
+
+
+// --- body metrics: the catalog owns the unit ids, so resolution is where this can go wrong ---
+{
+  const KG = "5c40aa79690c9d44eafb575c";
+  const LB = "5c40aa79690c9d44eafb575d";
+  const catalog = [
+    {
+      unique_code: "weight",
+      name: "Weight",
+      unit: { _id: KG },
+      category: { units: [{ _id: LB, unique_code: "lb" }, { _id: KG, unique_code: "kg" }] },
+    },
+    { unique_code: "steps", name: "Steps", category: { units: [{ _id: "s1", unique_code: "steps" }] } },
+    { unique_code: "neck_65d5", name: "Neck", category: { units: [{ _id: "c1", unique_code: "cm" }, { _id: "i1", unique_code: "in" }] } },
+  ];
+  // The metric's own unit wins when none is asked for — not the first in the list.
+  assert.deepEqual(bodyMetricEntry(catalog, "weight", 82.8), { unique_code: "weight", value: 82.8, unit: KG });
+  assert.equal(bodyMetricEntry(catalog, "weight", 182, "lb").unit, LB);
+  assert.equal(bodyMetricEntry(catalog, "weight", "182lb").unit, LB); // unit suffix on the value
+  assert.equal(bodyMetricEntry(catalog, "Weight", 82.8).value, 82.8); // display name
+  assert.equal(bodyMetricEntry(catalog, "neck", 40, "cm").unique_code, "neck_65d5"); // team-scoped code
+  assert.equal(bodyMetricEntry(catalog, "steps", 9000).unit, "s1"); // sole unit needs no default
+  assert.throws(() => bodyMetricEntry(catalog, "vo2", 50), /available: weight, steps/);
+  assert.throws(() => bodyMetricEntry(catalog, "weight", 82.8, "stone"), /must be one of: lb, kg/);
+  assert.throws(() => bodyMetricEntry(catalog, "neck", 40), /needs an explicit unit/); // ambiguous
+  assert.throws(() => bodyMetricEntry(catalog, "weight", "heavy"), /unparseable/);
+}
+
+// logBodyMetric shapes the POST body the iOS app sends, and buckets a bare date at local noon.
+{
+  const sent = [];
+  const client = createClient({ token: jwt({ profileId: "c1", exp: inDays(10) }), clientId: "c1" });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    sent.push({ u, body: init?.body && JSON.parse(init.body) });
+    const data = u.includes("get-full-list-client-body-metric")
+      ? [{ unique_code: "weight", name: "Weight", unit: { _id: "kgid" }, category: { units: [{ _id: "kgid", unique_code: "kg" }] } }]
+      : { _id: "e1", metric_code: "weight", value: 82.8, day: "09-04-2026" };
+    return new Response(JSON.stringify({ data }), { headers: { "content-type": "application/json" } });
+  };
+  try {
+    const e = await client.logBodyMetric({ metric: "weight", value: 82.8, date: "2026-09-04" });
+    assert.equal(e._id, "e1");
+    const post = sent.at(-1);
+    assert.match(post.u, /body-metric-entry\/add-entry$/);
+    assert.equal(post.body.client, "c1");
+    assert.equal(post.body.unique_code, "weight");
+    assert.equal(post.body.value, 82.8);
+    assert.equal(post.body.unit, "kgid");
+    // Local noon, so the server's day bucket cannot slip a day either side of UTC.
+    assert.equal(new Date(post.body.date).getDate(), 4);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 }
 
 console.log("ok");

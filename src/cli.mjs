@@ -11,6 +11,9 @@
 //   node cli.mjs log Run --duration 46 --distance 7.22km --hr 126   log a cardio session
 //   node cli.mjs edit <id> --duration 46 --distance 7.5km   change a logged activity
 //   node cli.mjs activity <id> | delete-activity <id>
+//   node cli.mjs metrics                     body metrics you can log, with their units
+//   node cli.mjs weigh 82.8 [--unit kg] [--date 2026-09-04]   log a body metric
+//   node cli.mjs metric weight 82.8 [--unit kg] [--date ...]
 //   node cli.mjs get <path> [k=v ...]        any endpoint, e.g. get habits/client-today
 // Env (EVERFIT_EMAIL/PASSWORD, EVERFIT_TOKEN) overrides the stored session.
 import { createInterface } from "node:readline";
@@ -32,7 +35,7 @@ const METRIC_FLAGS = {
   power: "power",
   reps: "reps",
 };
-const VALUE_FLAGS = new Set(["start", "end", "duration", "note", "library", ...Object.keys(METRIC_FLAGS)]);
+const VALUE_FLAGS = new Set(["start", "end", "duration", "note", "library", "unit", "date", ...Object.keys(METRIC_FLAGS)]);
 const opts = {};
 const args = [];
 for (let i = 0; i < rest.length; i++) {
@@ -212,6 +215,24 @@ try {
       if (!args[0]) throw new Error("usage: activity <activity_id>");
       out(await everfit.getActivity(args[0]));
       break;
+    case "metrics":
+      out(
+        (await everfit.listBodyMetrics()).map((m) => ({
+          metric: m.unique_code,
+          name: m.name,
+          units: (m.category?.units ?? []).map((u) => u.unique_code),
+        })),
+      );
+      break;
+    // `weigh 82.8` is the everyday case; `metric <name> <value>` covers the rest.
+    case "weigh":
+    case "metric": {
+      const [metric, value] = cmd === "weigh" ? ["weight", args[0]] : args;
+      if (!metric || value == null) throw new Error("usage: metric <name> <value> [--unit kg] [--date YYYY-MM-DD]");
+      const e = await everfit.logBodyMetric({ metric, value, unit: opts.unit, date: opts.date });
+      out({ entry_id: e._id, metric: e.metric_code, value: e.value, unit: e.unit, day: e.day, date: e.date });
+      break;
+    }
     case "get": {
       if (!args[0]) throw new Error("usage: get <path> [k=v ...]");
       const params = Object.fromEntries(args.slice(1).map((p) => p.split(/=(.*)/s).slice(0, 2)));
@@ -229,6 +250,9 @@ try {
           "      [--cadence 170] [--power 200] [--reps 50] [--note ...] [--dry-run]\n" +
           "  edit <activity_id> [--duration 46] [same metric flags] [--no-hr] [--note ...]\n" +
           "  activity <id> | delete-activity <id>\n" +
+          "  metrics                                   body metrics you can log\n" +
+          "  weigh <value> [--unit kg] [--date YYYY-MM-DD]\n" +
+          "  metric <name> <value> [--unit ...] [--date ...]\n" +
           "  get <path> [k=v ...]                      any endpoint",
       );
       process.exit(1);

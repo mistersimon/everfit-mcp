@@ -3,7 +3,7 @@
 MCP server + API client for [Everfit](https://everfit.io), from the **client** side (not coach).
 Reads your assigned training sessions, workout detail, and profile.
 
-Unofficial. Reverse-engineered from iOS app traffic (v3.84.2); Everfit can change or block these
+Unofficial. Reverse-engineered from iOS app traffic (v3.88.1); Everfit can change or block these
 endpoints at any time.
 
 ## Install
@@ -19,7 +19,7 @@ Not published yet? Three ways to install it elsewhere without a registry:
 
 ```bash
 npm pack                                  # produces everfit-mcp-<version>.tgz
-npm i -g ./everfit-mcp-0.0.2.tgz          # copy the tarball to any machine
+npm i -g ./everfit-mcp-0.0.3.tgz          # copy the tarball to any machine
 npx github:mistersimon/everfit-mcp        # or install straight from the git repo
 git clone https://github.com/mistersimon/everfit-mcp.git && npm install   # for development
 ```
@@ -142,8 +142,10 @@ long-lived unattended install needs the password to keep working.
 | `get_profile()` | Your client profile (name, units, timezone, trainer). |
 | `list_activity_types(query?)` | Activity types available to `log_activity` (Run, Walk, Cycling, ...). |
 | `log_activity({activity, duration_minutes \| end, start?, distance?, avg_heart_rate?, ...})` | **Writes.** Logs a cardio session your coach can see. Returns the new `activity_id` and an `undo` command. |
+| `list_body_metrics()` | Body metrics this account tracks (weight, steps, body_fat, ...) with the units each accepts. Your coach controls the list. |
+| `log_body_metric({metric, value, unit?, date?})` | **Writes.** Records a measurement, e.g. `{metric: "weight", value: 82.8}`. Returns the new `entry_id`. No API delete — remove mistakes in the app. |
 
-`log_activity` is the only tool that writes. Its description tells the model to confirm details
+`log_activity` and `log_body_metric` are the only tools that write. Its description tells the model to confirm details
 first and not to invent metrics, but that is a prompt, not a guarantee — an agent can create real
 entries in your training log. There is deliberately **no delete tool**, so nothing an agent does is
 destructive; remove a mistaken entry yourself with `everfit delete-activity <id>` (the tool returns
@@ -180,6 +182,11 @@ everfit activity <activity_id>         # read one back
 everfit edit <activity_id> --duration 46 --distance 7.22km
 everfit edit <activity_id> --no-hr --note "felt easy"   # --no-<metric> clears one
 everfit delete-activity <activity_id>  # remove it
+
+everfit metrics                        # body metrics you can log, with their units
+everfit weigh 82.8                     # shorthand for: metric weight 82.8
+everfit metric weight 82.8 --unit lb --date 2026-09-04
+everfit metric steps 9432
 ```
 
 - `--duration` is minutes. With no `--start`, the session is assumed to have just ended.
@@ -188,6 +195,9 @@ everfit delete-activity <activity_id>  # remove it
 - Each activity type accepts only some metrics — Run takes distance, avg_heart_rate and calories,
   and anything else is rejected with the list it does accept rather than being silently dropped.
 - `--dry-run` prints the payload without sending it.
+- `metric`/`weigh` take the metric's own unit unless you pass `--unit`; a metric with several units
+  and no stored preference asks for one rather than guessing. `--date` accepts `YYYY-MM-DD` (logged
+  at local noon) or a full ISO time. There is no delete — remove a bad entry in the app.
 - `edit` merges: the API replaces the whole record, so the client reads the current activity first
   and carries over anything you did not pass. Clear a single metric with `--no-hr`, `--no-distance`
   and so on. `rating` cannot be changed — the API accepts the field and ignores it (verified), so
@@ -231,6 +241,14 @@ test/index.mjs   npm test
   `160kg x5 @RPE7 rest120`.
 - Assignment `status`: 0 and 2 confirmed (`not_started`, `completed`); 1 (`in_progress`) is
   inferred. Unknown codes pass through as numbers.
+- Body metrics are a third object again: `POST /api/body-metric-entry/add-entry` with
+  `{client, date, unique_code, value, unit}`. `unique_code` selects the metric ("weight"), `unit`
+  is a per-metric ObjectId — there is no global unit table, so both come from
+  `GET /api/body-metric/get-full-list-client-body-metric?clientId=`. The server derives `type` and
+  the `MM-DD-YYYY` `day` bucket from `date`, so a date-only input is sent at local noon rather than
+  midnight. No delete endpoint appears in the captured traffic; entries have to be removed in the
+  app. The catalog returns every metric the workspace defines (36 on the captured account,
+  including coach-added ones keyed `<name>_<teamId>`), which is a superset of what the app shows.
 - Logged activities (cardio) are a separate object from workout assignments:
   `POST /api/log-activities` with `{log_activity_library, tracking_fields, start_time, end_time,
   icon, background_icon_color}`. Duration is implied by the timestamps — there is no duration field.
