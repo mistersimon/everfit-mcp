@@ -317,6 +317,47 @@ await assert.rejects(
   }
 }
 
+// --- device id + 2FA: login needs x-device-token; an untrusted id gets an emailed code to verify ---
+{
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  const trusted = new Set();
+  globalThis.fetch = async (url, opts) => {
+    seen.push({ url: String(url), headers: opts.headers, body: opts.body });
+    // As observed live: verify-otp succeeds without a token, and from then on the device is trusted.
+    if (String(url).endsWith("/2fa/verify-otp")) {
+      trusted.add(opts.headers["x-device-token"]);
+      return new Response(JSON.stringify({ data: { verified: true } }));
+    }
+    if (!trusted.has(opts.headers["x-device-token"]))
+      return new Response(JSON.stringify({ requires_2fa: true, two_fa_token: "2fa-t" }));
+    return new Response(JSON.stringify({ token: jwt({ profileId: "abc", exp: inDays(10) }), user: { _id: "abc" } }));
+  };
+  try {
+    // No way to ask for the code (the MCP server): say how to fix it instead of hanging.
+    await assert.rejects(createClient({ email: "e", password: "p", deviceId: "DEV-1" }).login(), /2FA.*everfit login/);
+    assert.equal(seen[0].headers["x-device-token"], "DEV-1");
+
+    seen.length = 0;
+    const s = await createClient({ email: "e", password: "p", deviceId: "DEV-1", getOtp: async () => " 123456 " }).login();
+    assert.equal(s.clientId, "abc");
+    const verify = seen[1];
+    assert.match(verify.url, /\/auth\/2fa\/verify-otp$/);
+    assert.equal(verify.headers["x-access-token"], "2fa-t"); // the 2FA token stands in for the access token
+    assert.equal(verify.headers["x-device-token"], "DEV-1"); // same id gets trusted
+    assert.deepEqual(JSON.parse(verify.body), { code: "123456", two_fa_token: "2fa-t" });
+    assert.ok(seen[2].url.endsWith("/auth/login/"), "re-login after verify to get a real token");
+    assert.ok(s.token && s.expiresAt > Date.now() + 864e5, "session must carry the token, not a stub");
+
+    // No id given: a random one is still sent, since login is refused without any.
+    seen.length = 0;
+    await createClient({ email: "e", password: "p", getOtp: async () => "1" }).login();
+    assert.match(seen[0].headers["x-device-token"], /^[0-9A-F-]{36}$/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 // --- error bodies: condensed for humans and model context, full body kept on the error ---
 {
   const realFetch = globalThis.fetch;

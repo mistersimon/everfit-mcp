@@ -47,6 +47,7 @@ export function storedClientOptions(path = sessionPath()) {
     password: process.env.EVERFIT_PASSWORD ?? s.password,
     token: process.env.EVERFIT_TOKEN ?? s.token,
     clientId: process.env.EVERFIT_CLIENT_ID ?? s.clientId,
+    deviceId: process.env.EVERFIT_DEVICE_ID ?? s.deviceId,
     onSession: (next) => {
       // Only rewrite what we already own; never create a session file from env-only config.
       if (!readSession(path)) return;

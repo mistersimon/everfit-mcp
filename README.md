@@ -86,6 +86,10 @@ Prompts for email and password (password is not echoed) and writes a session to
 { "mcpServers": { "everfit": { "command": "npx", "args": ["-y", "everfit-mcp"] } } }
 ```
 
+The first login from a new machine triggers Everfit's two-factor check: Everfit emails you a
+6-digit code and `everfit login` asks for it. The session file keeps the device id Everfit now
+trusts, so renewals after that need no code (until Everfit's trust expires, roughly six months).
+
 `everfit whoami` shows who is logged in and when the token expires; `everfit logout` deletes the file.
 
 `--save-password` stores the password alongside the token so the session renews itself indefinitely.
@@ -101,6 +105,7 @@ Env always wins over the stored session, which is what you want for containers a
 | --- | --- |
 | `EVERFIT_EMAIL`, `EVERFIT_PASSWORD` | Log in on demand, renew forever. Best for containers. |
 | `EVERFIT_TOKEN` | Use an existing token, no password anywhere. Get one from `everfit login`. Expires ~10 days after issue and cannot renew itself. |
+| `EVERFIT_DEVICE_ID` | Device id Everfit trusts after 2FA. `everfit login` generates and stores one, so you only need this with env-only credentials: run `everfit login` once, copy `deviceId` from the session file, and set it here. Otherwise every fresh process looks like a new device and gets a 2FA challenge it cannot answer. |
 | `EVERFIT_TZ` | Timezone header. Defaults to the system timezone. |
 | `EVERFIT_API_BASE` | Override the API host if your account is on a different backend shard. |
 | `EVERFIT_STATE_DIR` | Where the session file lives. Defaults to `$XDG_CONFIG_HOME/everfit` or `~/.config/everfit`. |
@@ -269,8 +274,50 @@ node src/cli.mjs login   # run the CLI from a clone without installing
 claude mcp add everfit-dev -- node "$PWD/src/server.mjs"   # register the working tree
 ```
 
-If you capture your own traffic with mitmproxy, remember the flow file contains your plaintext
-password and a live token. `.gitignore` excludes `*.flows` and `*.har`; keep it that way.
+### Capturing the iOS app's traffic
+
+How the endpoints and headers here were found, and what to redo when Everfit changes something
+(for example, login starts returning `400 Please update the app to the latest version`).
+
+On the Mac:
+
+```bash
+ipconfig getifaddr en0   # the Mac's LAN IP, needed on the phone
+mitmweb --listen-port 8080 -w everfit.flows --set confdir=~/.mitmproxy
+```
+
+The web UI opens at <http://127.0.0.1:8081>. If macOS asks whether to accept incoming connections
+for Python/mitmweb, allow it.
+
+On the iPhone (same Wi-Fi as the Mac):
+
+1. **Settings → Wi-Fi → (i) on your network → Configure Proxy → Manual**: server = the Mac's IP,
+   port `8080`.
+2. Open **Safari** (not another browser) at <http://mitm.it> and download the iOS certificate. If
+   the page says traffic isn't going through mitmproxy, the proxy setting or firewall is wrong.
+3. **Settings → General → VPN & Device Management** → the mitmproxy profile → **Install**.
+4. **Settings → General → About → Certificate Trust Settings** → turn on full trust for
+   mitmproxy. Without this step HTTPS requests fail with certificate errors.
+5. Update the Everfit app to the latest version, log out, and log back in so the login request is
+   captured. Then do whatever else you want to see (log a weight, a run, etc.).
+
+In mitmweb, filter with `~d everfit.io`, or read the file afterwards:
+
+```bash
+mitmdump -nr everfit.flows --flow-detail 3 '~u auth/login'
+```
+
+Compare the request headers and body with `doLogin` in `src/client.mjs`.
+
+The iOS app keeps its device id across reinstalls, so a trusted phone never shows the 2FA step.
+The 2FA endpoints (`/api/auth/2fa/verify-otp`, `resend-otp`, `ping`) came from the web app's
+JavaScript at <https://app.everfit.io> instead.
+
+When done: set the phone's proxy back to **Off** (otherwise it has no internet once mitmweb stops)
+and delete the mitmproxy profile under VPN & Device Management.
+
+The flow file contains your plaintext password and a live token. `.gitignore` excludes `*.flows`
+and `*.har`; keep it that way, and delete the file once you have what you need.
 
 ## License
 

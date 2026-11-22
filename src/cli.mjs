@@ -100,11 +100,15 @@ try {
     case "login": {
       const email = process.env.EVERFIT_EMAIL || args[0] || (await ask("Everfit email: "));
       const password = process.env.EVERFIT_PASSWORD || (await ask("Password: ", { hidden: true }));
-      const fresh = createClient({ email, password });
+      // A stable device id is what Everfit trusts after 2FA, so reuse the stored one across logins.
+      const deviceId = process.env.EVERFIT_DEVICE_ID ?? readSession()?.deviceId ?? crypto.randomUUID().toUpperCase();
+      const getOtp = () => ask("Everfit emailed you a verification code: ");
+      const fresh = createClient({ email, password, deviceId, getOtp });
       const s = await fresh.login();
       // --save-password trades a secret at rest for a session that renews itself past 10 days.
       writeSession({
         email,
+        deviceId,
         ...(flags.has("--save-password") ? { password } : {}),
         token: s.token,
         clientId: s.clientId,

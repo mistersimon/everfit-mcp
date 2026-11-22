@@ -1,6 +1,6 @@
 {
   "name": "everfit-mcp",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "MCP server and API client for Everfit (client-side): read your training sessions, workouts and profile, log cardio activities and body metrics",
   "license": "MIT",
   "repository": {

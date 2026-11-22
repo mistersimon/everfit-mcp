@@ -1,10 +1,21 @@
-// Pure Everfit API client — no MCP. Reverse-engineered from iOS app traffic (v3.88.1).
+// Pure Everfit API client — no MCP. Reverse-engineered from iOS app traffic (v3.99.1).
 // Usable standalone: import { createClient } from "./client.mjs"
 // No `process` on Hermes/browsers/Workers — read env defensively so this file loads anywhere.
 const env = typeof process === "undefined" ? {} : (process.env ?? {});
 // Overridable: accounts on another backend shard set EVERFIT_API_BASE.
 const DEFAULT_BASE = env.EVERFIT_API_BASE ?? "https://api-prod4.everfit.io/api";
-const UA = "everfit/3.88.1 (io.everfit.appv2; build:1; iOS 26.5.0) Alamofire/5.4.3";
+// Mirrors the app's identity headers; the server refuses login from builds it considers outdated.
+const APP_VERSION = "3.99.1";
+const APP_BUILD = "2";
+const IOS_VERSION = "27.2";
+const UA = `everfit/${APP_VERSION} (io.everfit.appv2; build:${APP_BUILD}; iOS ${IOS_VERSION}.0) Alamofire/5.12.2`;
+const APP_HEADERS = {
+  "x-app-type": "ios-client",
+  "user-agent": UA,
+  agent: "ios",
+  "agent-app-build": `${APP_VERSION} (${APP_BUILD})`,
+  "agent-device-os": IOS_VERSION,
+};
 const systemTz = () => Intl.DateTimeFormat().resolvedOptions().timeZone ?? "UTC";
 
 const pad = (n) => String(n).padStart(2, "0");
@@ -204,11 +215,17 @@ function summarizeErrorBody(status, body = "") {
  * @param {string} [opts.token]    pre-existing x-access-token, skips login
  * @param {string} [opts.clientId] required alongside token for date-range queries
  * @param {string} [opts.baseUrl]  defaults to EVERFIT_API_BASE, else api-prod4
+ * @param {string} [opts.deviceId] defaults to EVERFIT_DEVICE_ID, else a random UUID; sent as x-device-token.
+ *        Login is refused without one. An id the account hasn't trusted yet gets a 2FA challenge (code by
+ *        email); once verified it stays trusted for months, so persist it.
+ * @param {() => Promise<string>} [opts.getOtp] asked for the emailed 2FA code when Everfit wants one;
+ *        without it a 2FA challenge is an error
  * @param {(s: {token: string, clientId: string, expiresAt: number}) => void} [opts.onSession]
  *        called after every successful login, so a caller can persist the renewed token
  */
-export function createClient({ email, password, timezone, token, clientId, baseUrl, onSession } = {}) {
+export function createClient({ email, password, timezone, token, clientId, baseUrl, deviceId, getOtp, onSession } = {}) {
   email ??= env.EVERFIT_EMAIL;
+  deviceId ??= env.EVERFIT_DEVICE_ID ?? globalThis.crypto?.randomUUID?.().toUpperCase();
   password ??= env.EVERFIT_PASSWORD;
   const BASE = (baseUrl ?? DEFAULT_BASE).replace(/\/$/, "");
   const tz = timezone ?? env.EVERFIT_TZ ?? systemTz();
@@ -217,19 +234,33 @@ export function createClient({ email, password, timezone, token, clientId, baseU
   let session = token ? { token, ...decodeToken(token), clientId: clientId ?? decodeToken(token).clientId } : null;
   let pending = null;
 
-  const headers = (extra) => ({ "x-app-type": "ios-client", "user-agent": UA, timezone: tz, ...extra });
+  const headers = (extra) => ({ ...APP_HEADERS, timezone: tz, ...extra });
   // Re-login this far before exp rather than waiting to be refused mid-request.
   const EXPIRY_SKEW_MS = 5 * 60_000;
   const isUsable = (s) => s?.token && (!s.expiresAt || s.expiresAt - EXPIRY_SKEW_MS > Date.now());
 
-  async function doLogin() {
+  async function postLogin() {
     const r = await fetch(`${BASE}/auth/login/`, {
       method: "POST",
-      headers: headers({ "content-type": "application/x-www-form-urlencoded" }),
+      headers: headers({
+        "content-type": "application/x-www-form-urlencoded",
+        ...(deviceId ? { "x-device-token": deviceId } : {}),
+      }),
       body: new URLSearchParams({ email, password }),
     });
     if (!r.ok) throw new EverfitError(r.status, "auth/login", await r.text());
-    const d = await r.json();
+    return r.json();
+  }
+
+  async function doLogin() {
+    let d = await postLogin();
+    if (d.requires_2fa) {
+      const v = await verifyOtp(d.two_fa_token);
+      // verify-otp's reply has no usable token, but it trusts the device, so a plain re-login does.
+      d = v?.token ? v : await postLogin();
+    }
+    // Never hand back a session without a token: callers would persist it and fail later, confusingly.
+    if (!d?.token) throw new Error(`auth/login: no token in Everfit's reply (keys: ${Object.keys(d ?? {}).join(", ")})`);
     return {
       token: d.token,
       clientId: d.user?._id ?? decodeToken(d.token).clientId,
@@ -237,6 +268,21 @@ export function createClient({ email, password, timezone, token, clientId, baseU
       // Trust the token's own exp; token_expiry (~10 days, as ms) is the fallback.
       expiresAt: decodeToken(d.token).expiresAt ?? Date.now() + (d.token_expiry ?? 0),
     };
+  }
+
+  // Endpoint and body from the web app's bundle; the two_fa_token doubles as the access token.
+  async function verifyOtp(twoFaToken) {
+    if (!getOtp)
+      throw new Error("auth/login: Everfit wants 2FA for this device — run `everfit login` in a terminal to enter the emailed code");
+    const code = String(await getOtp()).trim();
+    const r = await fetch(`${BASE}/auth/2fa/verify-otp`, {
+      method: "POST",
+      headers: headers({ "content-type": "application/json", "x-access-token": twoFaToken, "x-device-token": deviceId }),
+      body: JSON.stringify({ code, two_fa_token: twoFaToken }),
+    });
+    if (!r.ok) throw new EverfitError(r.status, "auth/2fa/verify-otp", await r.text());
+    const j = await r.json();
+    return j.data ?? j;
   }
 
   /**

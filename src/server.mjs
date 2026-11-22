@@ -20,7 +20,7 @@ const json = (fn) => async (args) => {
     return { content: [{ type: "text", text: JSON.stringify(await fn(args ?? {}), null, 1) }] };
   } catch (e) {
     // Auth failures are the user's to fix in a terminal, so say that instead of leaking a stack.
-    const needsLogin = /EVERFIT_EMAIL|token expired|E_UNAUTHORIZED/.test(e.message);
+    const needsLogin = /EVERFIT_EMAIL|token expired|E_UNAUTHORIZED|2FA/.test(e.message);
     return {
       isError: true,
       content: [
